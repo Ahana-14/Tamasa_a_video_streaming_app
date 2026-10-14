@@ -23,22 +23,41 @@ const windowStart = (days: number) => {
 };
 // in overview() and videoAnalytics():  const since = windowStart(days);
 
-/** Views per UTC day. A "view" = one watch_history row (one play start by a signed-in viewer). */
+/**
+ * A "view" is an account's FIRST watch of a video: the same rule that moves the public counter (playback.service),
+ * so the numbers for a period can never add up to more than the lifetime total. Replays are not views.
+ * Returns each (account, video) pair with the time of its first watch.
+ */
+const firstWatches = (creatorId: string, videoId?: string) => Prisma.sql`
+  SELECT MIN(h."watchedAt") AS first_at
+  FROM watch_history h
+  JOIN videos v ON v.id = h."videoId"
+  WHERE v."creatorId" = ${creatorId}
+    AND v."deletedAt" IS NULL
+    ${videoId ? Prisma.sql`AND h."videoId" = ${videoId}` : Prisma.empty}
+  GROUP BY h."userId", h."videoId"
+`;
+
+/** Views per UTC day (first watches only). */
 const viewsByDay = async (creatorId: string, since: Date, videoId?: string) => {
   const rows = await prisma.$queryRaw<
     Array<{ day: Date; count: bigint }>
   >(Prisma.sql`
-    SELECT date_trunc('day', h."watchedAt" AT TIME ZONE 'UTC') AS day, COUNT(*)::bigint AS count
-    FROM watch_history h
-    JOIN videos v ON v.id = h."videoId"
-    WHERE v."creatorId" = ${creatorId}
-      AND v."deletedAt" IS NULL
-      AND h."watchedAt" >= ${since}
-      ${videoId ? Prisma.sql`AND h."videoId" = ${videoId}` : Prisma.empty}
+    SELECT date_trunc('day', f.first_at AT TIME ZONE 'UTC') AS day, COUNT(*)::bigint AS count
+    FROM (${firstWatches(creatorId, videoId)}) f
+    WHERE f.first_at >= ${since}
     GROUP BY 1
     ORDER BY 1
   `);
   return rows.map((r) => ({ day: new Date(r.day), count: Number(r.count) }));
+};
+
+/** Views inside the window (first watches only). */
+const viewsInPeriod = async (creatorId: string, since: Date, videoId?: string) => {
+  const rows = await prisma.$queryRaw<Array<{ count: bigint }>>(Prisma.sql`
+    SELECT COUNT(*)::bigint AS count FROM (${firstWatches(creatorId, videoId)}) f WHERE f.first_at >= ${since}
+  `);
+  return Number(rows[0]?.count ?? 0);
 };
 
 export const StudioService = {
@@ -52,7 +71,7 @@ export const StudioService = {
         videoCount,
         followerCount,
         newFollowers,
-        viewsInPeriod,
+        periodViews,
         series,
         topVideos,
       ] = await Promise.all([
@@ -72,12 +91,7 @@ export const StudioService = {
         prisma.follow.count({
           where: { creatorId: creator.id, createdAt: { gte: since } },
         }),
-        prisma.watchHistory.count({
-          where: {
-            watchedAt: { gte: since },
-            video: { creatorId: creator.id, deletedAt: null },
-          },
-        }),
+        viewsInPeriod(creator.id, since),
         viewsByDay(creator.id, since),
         prisma.video.findMany({
           where: {
@@ -123,7 +137,7 @@ export const StudioService = {
           comments: Number(totals._sum.commentCount ?? 0),
           shares: Number(totals._sum.shareCount ?? 0),
         },
-        period: { views: viewsInPeriod, newFollowers },
+        period: { views: periodViews, newFollowers },
         viewsByDay: fillDailySeries(series, days),
         topVideos: top,
       };
@@ -146,16 +160,9 @@ export const StudioService = {
         throw new ApiError(403, 'Not your video');
       const since = windowStart(days);
 
-      const [viewsInPeriod, uniqueViewers, progress, completedCount, series] =
+      const [periodViews, progress, completedCount, series] =
         await Promise.all([
-          prisma.watchHistory.count({
-            where: { videoId, watchedAt: { gte: since } },
-          }),
-          prisma.watchHistory.findMany({
-            where: { videoId, watchedAt: { gte: since } },
-            distinct: ['userId'],
-            select: { userId: true },
-          }),
+          viewsInPeriod(creator.id, since, videoId),
           prisma.watchProgress.aggregate({
             where: { videoId },
             _avg: { completionPercent: true },
@@ -175,7 +182,8 @@ export const StudioService = {
           comments: Number(video.commentCount),
           shares: Number(video.shareCount),
         },
-        period: { views: viewsInPeriod, uniqueViewers: uniqueViewers.length },
+        // views are first watches, so each one is a different account: viewers and views are the same number
+        period: { views: periodViews, uniqueViewers: periodViews },
         engagement: {
           watchers: progress._count._all,
           averageCompletionPercent:
