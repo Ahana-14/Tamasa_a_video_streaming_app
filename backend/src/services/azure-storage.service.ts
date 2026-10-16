@@ -255,7 +255,8 @@ export const AzureStorageService = {
         {
           containerName: containers[containerName].containerName,
           blobName,
-          permissions: BlobSASPermissions.parse('cw'),
+          // r: lets the app ask which blocks of an interrupted upload are already stored, so it sends only the rest
+          permissions: BlobSASPermissions.parse('rcw'),
           startsOn: new Date(),
           expiresOn,
         },

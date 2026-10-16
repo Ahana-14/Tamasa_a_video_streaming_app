@@ -8,6 +8,9 @@ import { NotificationService } from './notification.service';
 import { VIDEO_CARD_INCLUDE } from '../lib/videoWhere';
 import { presentVideoCards } from '../lib/videoCard';
 
+/** How long an upload link works. A large video on a slow connection takes a while, so this is generous. */
+const UPLOAD_LINK_MINUTES = 180;
+
 const requireCreatorProfile = async (clerkUserId: string) => {
   const user = await prisma.user.findUnique({
     where: { clerkUserId },
@@ -92,6 +95,7 @@ export const VideoService = {
       const uploadUrl = await AzureStorageService.generateUploadSasUrl(
         'originals',
         blobPath,
+        UPLOAD_LINK_MINUTES,
       );
 
       return {
@@ -104,6 +108,33 @@ export const VideoService = {
     } catch (error) {
       if (error instanceof ApiError) throw error;
       throw new ApiError(500, 'Failed to initialize video upload', error);
+    }
+  },
+
+  /**
+   * A fresh upload link for a video whose upload has not finished, so an interrupted upload can carry on where it
+   * stopped (the blocks Azure already holds stay valid for a week) instead of starting again.
+   */
+  refreshUploadUrl: async (clerkUserId: string, videoId: string) => {
+    try {
+      const { creatorProfile } = await requireCreatorProfile(clerkUserId);
+      const video = await prisma.video.findUnique({
+        where: { id: videoId },
+        include: { originalAsset: true },
+      });
+      if (!video || video.deletedAt) throw new ApiError(404, 'Video not found');
+      if (video.creatorId !== creatorProfile.id) throw new ApiError(403, 'Not your video');
+      if (video.status !== 'UPLOADING' || !video.originalAsset)
+        throw new ApiError(409, 'This upload is already finished');
+      const uploadUrl = await AzureStorageService.generateUploadSasUrl(
+        'originals',
+        video.originalAsset.blobPath,
+        UPLOAD_LINK_MINUTES,
+      );
+      return { uploadUrl };
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(500, 'Failed to refresh the upload link', error);
     }
   },
 

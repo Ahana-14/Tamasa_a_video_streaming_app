@@ -77,6 +77,20 @@ videosRouter.post(
   }),
 );
 
+/** POST /api/videos/:videoId/upload-url
+ * A fresh signed upload link for an unfinished upload, used to resume after the connection dropped.
+ */
+videosRouter.post(
+  '/videos/:videoId/upload-url',
+  authenticateUser,
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const clerkUserId = req.auth?.userId;
+    if (!clerkUserId) throw new ApiError(401, 'Unauthorized: No user ID found in request');
+    const result = await VideoService.refreshUploadUrl(clerkUserId, parseVideoId(req.params.videoId));
+    sendSuccessResponse(res, result);
+  }),
+);
+
 /** POST /api/videos/:videoId/complete
  * verifies the raw video file has been uploaded to Azure Blob Storage, and then triggers the video processing pipeline (transcoding, thumbnail generation, etc.). This endpoint is called by the client after the raw video upload is complete.
  */

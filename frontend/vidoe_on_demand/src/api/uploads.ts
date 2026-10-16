@@ -23,6 +23,10 @@ export type VideoUploadTicket = {
 export const initVideoUpload = (api: Api, body: VideoUploadInput) =>
   api.post<VideoUploadTicket>('/api/videos/init', body, required);
 
+/** A fresh signed upload link for an unfinished upload (to resume after the connection dropped). */
+export const refreshVideoUploadUrl = (api: Api, videoId: string) =>
+  api.post<{ uploadUrl: string }>(`/api/videos/${videoId}/upload-url`, undefined, required);
+
 export const completeVideoUpload = (api: Api, videoId: string) =>
   api.post(`/api/videos/${videoId}/complete`, undefined, required);
 

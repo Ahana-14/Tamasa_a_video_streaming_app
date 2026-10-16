@@ -1,3 +1,4 @@
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useQueryClient } from '@tanstack/react-query';
 import { useRef, useState } from 'react';
 import { isApiError } from '@/api/ApiError';
@@ -5,6 +6,7 @@ import {
   completeVideoUpload,
   confirmThumbnail,
   initVideoUpload,
+  refreshVideoUploadUrl,
   requestThumbnailUpload,
   type VideoUploadInput,
   type VideoUploadTicket,
@@ -13,6 +15,7 @@ import { useApi } from '@/lib/auth/useApi';
 import type { PickedImage } from '@/lib/media/pickImage';
 import type { PickedVideo } from '@/lib/media/pickVideo';
 import { UploadCancelledError, UploadFileMissingError, uploadToBlob } from '@/lib/upload/blobUpload';
+import { uploadInBlocks } from '@/lib/upload/blockUpload';
 
 export type UploadPhase =
   | 'idle'
@@ -33,8 +36,10 @@ export type UploadResult =
   | { ok: true; videoId: string; thumbnailFailed: boolean }
   | { ok: false; error: string; cancelled: boolean };
 
-// The signed URL lasts 15 minutes on the backend. Reuse a ticket on retry only while it is comfortably valid.
-const TICKET_MAX_AGE_MS = 10 * 60 * 1000;
+// The upload link is renewed (cheap) whenever an attempt is picked up again; Azure keeps the blocks already sent for a
+// week, so an attempt stays resumable long after its link expired. The backend discards unfinished uploads after 24 h.
+const ATTEMPT_MAX_AGE_MS = 20 * 60 * 60 * 1000;
+const ATTEMPT_KEY = 'upload-attempt-v1';
 
 type Attempt = {
   signature: string;
@@ -42,6 +47,23 @@ type Attempt = {
   createdAt: number;
   uploaded: boolean;
   thumbnailDone: boolean;
+};
+
+// Kept on the phone so an upload also resumes after the app was closed or the phone restarted.
+const saveAttempt = (attempt: Attempt | null) => {
+  const write = attempt
+    ? AsyncStorage.setItem(ATTEMPT_KEY, JSON.stringify(attempt))
+    : AsyncStorage.removeItem(ATTEMPT_KEY);
+  void write.catch(() => {});
+};
+const loadAttempt = async (signature: string): Promise<Attempt | null> => {
+  try {
+    const raw = await AsyncStorage.getItem(ATTEMPT_KEY);
+    const saved = raw ? (JSON.parse(raw) as Attempt) : null;
+    return saved && saved.signature === signature && Date.now() - saved.createdAt < ATTEMPT_MAX_AGE_MS ? saved : null;
+  } catch {
+    return null;
+  }
 };
 
 /**
@@ -73,22 +95,31 @@ export const useVideoUpload = () => {
     abort.current = controller;
     const signal = controller.signal;
 
+    // The same video + details means the same upload, even if the file was picked again after the app was closed.
     const signature = JSON.stringify([
-      input.video.uri,
+      input.video.name,
+      input.video.sizeBytes,
       input.title,
       input.description,
       input.categoryId,
-      input.thumbnail?.uri ?? null,
+      input.thumbnail ? 'custom' : 'auto',
     ]);
 
     try {
-      let current = attempt.current;
-      const reusable =
-        current &&
-        current.signature === signature &&
-        Date.now() - current.createdAt < TICKET_MAX_AGE_MS;
+      let current: Attempt | null = attempt.current ?? (await loadAttempt(signature));
+      if (current && current.signature !== signature) current = null;
 
-      if (!reusable || !current) {
+      // An earlier attempt: get a fresh link for it. If the server no longer has that upload, start over.
+      if (current && !current.uploaded) {
+        try {
+          current.ticket.uploadUrl = (await refreshVideoUploadUrl(api, current.ticket.videoId)).uploadUrl;
+        } catch (error) {
+          if (isApiError(error) && (error.status === 404 || error.status === 409 || error.status === 403)) current = null;
+          else throw error;
+        }
+      }
+
+      if (!current) {
         setPhase('preparing');
         setProgress(0);
         const ticket = await initVideoUpload(api, {
@@ -98,25 +129,26 @@ export const useVideoUpload = () => {
           fileExtension: input.video.extension,
           thumbnailSource: input.thumbnail ? 'CUSTOM' : 'AUTO',
         });
-        current = {
-          signature,
-          ticket,
-          createdAt: Date.now(),
-          uploaded: false,
-          thumbnailDone: false,
-        };
-        attempt.current = current;
+        current = { signature, ticket, createdAt: Date.now(), uploaded: false, thumbnailDone: false };
       }
+      attempt.current = current;
+      saveAttempt(current);
+      const live = current;
 
       if (!current.uploaded) {
         setPhase('uploading');
         setProgress(0);
-        await uploadToBlob(current.ticket.uploadUrl, input.video.uri, {
+        await uploadInBlocks(current.ticket.uploadUrl, input.video.uri, {
           contentType: input.video.contentType,
           onProgress,
           signal,
+          refreshUrl: async () => {
+            live.ticket.uploadUrl = (await refreshVideoUploadUrl(api, live.ticket.videoId)).uploadUrl;
+            return live.ticket.uploadUrl;
+          },
         });
         current.uploaded = true;
+        saveAttempt(current);
       }
 
       let thumbnailFailed = false;
@@ -134,6 +166,7 @@ export const useVideoUpload = () => {
           });
           await confirmThumbnail(api, current.ticket.videoId, t.blobName);
           current.thumbnailDone = true;
+          saveAttempt(current);
         } catch (error) {
           if (error instanceof UploadCancelledError) throw error;
           // The video matters more than its cover: carry on, the worker generates one automatically.
@@ -146,11 +179,13 @@ export const useVideoUpload = () => {
 
       const videoId = current.ticket.videoId;
       attempt.current = null;
+      saveAttempt(null);
       await qc.invalidateQueries({ queryKey: ['studio'] });
       return { ok: true, videoId, thumbnailFailed };
     } catch (error) {
       if (error instanceof UploadCancelledError) {
         attempt.current = null;
+        saveAttempt(null);
         return { ok: false, error: 'Upload cancelled.', cancelled: true };
       }
       return {
@@ -159,7 +194,7 @@ export const useVideoUpload = () => {
           ? error.message
           : error instanceof UploadFileMissingError
             ? error.message
-            : "The upload didn't finish. Check your connection and try again.",
+            : "The upload was interrupted. Your progress is saved: tap Try again and it continues where it stopped.",
         cancelled: false,
       };
     } finally {

@@ -32,6 +32,8 @@ const UPLOAD_DIR = `${FS.documentDirectory}pending-uploads/`;
 const keepSafe = async (uri: string, extension: string): Promise<string> => {
   try {
     await FS.makeDirectoryAsync(UPLOAD_DIR, { intermediates: true });
+    // Anything left from an earlier pick (an upload that was never finished) is no longer needed.
+    for (const old of await FS.readDirectoryAsync(UPLOAD_DIR)) await FS.deleteAsync(`${UPLOAD_DIR}${old}`, { idempotent: true });
     const target = `${UPLOAD_DIR}${Date.now()}.${extension}`;
     await FS.moveAsync({ from: uri, to: target });
     return target;
