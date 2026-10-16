@@ -21,14 +21,14 @@ worker, PostgreSQL, Azure Blob Storage and Azure container hosting.
 8. [System design deep dives](#8-system-design-deep-dives)
 9. [Data model](#9-data-model)
 10. [Deployment and operations](#10-deployment-and-operations)
-11. [Complexity analysis (time and space)](#11-complexity-analysis-time-and-space)
-12. [Limitations](#12-limitations)
-13. [Challenges we hit and how we solved them](#13-challenges-we-hit-and-how-we-solved-them)
-14. [Future plans](#14-future-plans)
-15. [Running it locally](#15-running-it-locally)
-16. [Testing](#16-testing)
-17. [Related documents](#17-related-documents)
-
+11. [Security](#11-security)
+12. [Complexity analysis (time and space)](#12-complexity-analysis-time-and-space)
+13. [Limitations](#13-limitations)
+14. [Challenges we hit and how we solved them](#14-challenges-we-hit-and-how-we-solved-them)
+15. [Future plans](#15-future-plans)
+16. [Running it locally](#16-running-it-locally)
+17. [Testing](#17-testing)
+18. [Related documents](#18-related-documents)
 ---
 
 ## 1. Project goal
@@ -257,7 +257,7 @@ screens (src/app) → feature components → hooks (TanStack Query) → api/ cli
 2. The Clerk webhook route is mounted **before** JSON parsing (it needs the raw body for signature verification) and has
    a strict rate limiter.
 3. `express.json()`, then the general **API rate limiter** (per IP) and a **token-bucket limiter** (per user, with IP
-   fallback). Video segment traffic has its own, much higher limiter so playback never exhausts the normal budget.
+   fallback; it is Redis-backed, so it is a no-op while Redis is not deployed, see [§11.6](#11-security)). Video segment traffic has its own, much higher limiter so playback never exhausts the normal budget.
 4. Routers mounted under `/api`; then a 404 handler and a central error handler that maps `ApiError` to the
    `{ success, error }` response envelope.
 
@@ -430,7 +430,8 @@ Deleting a video (or letting the safety-net purge do it):
 - **Cache-aside** helper (`cache/`) for categories, public creator profile, public video metadata, trending; personalised
   fields (`isLiked`, progress, …) are never cached. Redis is **optional**: with no `REDIS_URL` every call falls back to
   PostgreSQL / a local limiter.
-- **Rate limiting:** per-IP window limiter + per-user token bucket + separate high limit for stream traffic.
+- **Rate limiting:** per-IP window limiter + separate high limit for stream traffic; a per-user token bucket is also
+  implemented but needs Redis, so it is inactive in the current deployment.
 - **Cursor pagination** everywhere; composite indexes for the hot queries (feed, creator videos, notifications, library).
 - The API is stateless apart from small, harmless in-process caches, so it can scale to several replicas.
 
@@ -522,7 +523,152 @@ storage.
 
 ---
 
-## 11. Complexity analysis (time and space)
+## 11. Security
+
+This section describes the protections that exist **today**, what was verified, and, just as important, what is **not**
+covered yet. It is an engineering self-assessment, not an independent audit or a penetration test.
+
+### 11.1 How secure is it? (honest summary)
+
+| | |
+|---|---|
+| **Overall** | Solid for its purpose (a community-scale app, ~500 users): authentication is delegated to a specialist provider, every protected action is authorised on the server, video and storage are private by default, transport is encrypted, nothing sensitive is committed to the repository, and cloud access follows least privilege. |
+| **Not claimed** | It has not had an external security review or penetration test, has no DRM, no web application firewall, no admin audit log and no automated dependency/secret scanning. Section 11.6 lists the known gaps and how to close each. |
+| **Biggest real-world risks today** | (1) A signed-in creator can upload very large or non-video files (no size/type cap on the upload link); (2) the per-user rate limiter is inactive while Redis is not deployed; (3) anyone who can *play* a video can capture it (no DRM). |
+
+### 11.2 Controls by layer
+
+**Identity and sessions**
+- Sign-in, passwords, social logins, password reset and sessions are handled by **Clerk**. Passwords never reach our
+  servers or database.
+- The API verifies the Clerk JWT on every protected request (`authenticateUser`); anonymous access exists only for
+  public content (`optionalAuth`).
+- On the phone, session tokens are kept in the OS keystore (`expo-secure-store`), not in plain storage.
+- User lifecycle events arrive through a Clerk **webhook that is verified with Svix signatures** (id, timestamp,
+  signature headers); unsigned or altered calls are rejected. The webhook route has its own strict rate limit.
+- Usernames are permanent and unique (case-insensitive); a deleted account releases its name, loses its Clerk login, and
+  its data is removed (§8.4).
+
+**Authorisation (who may do what)**
+- Rules live in the service layer, not only in the UI: a creator can edit, publish, delete, or read Studio data only
+  for **their own** videos (ownership is checked and answered with 403/404); comment moderation is limited to the video's
+  owner; library, history, notifications and settings are always scoped to the signed-in user.
+- **Visibility is enforced on the server** for every read: `PRIVATE` videos are visible to the owner only, `UNLISTED`
+  videos are reachable by link but never appear in feeds, search or Shorts, `PUBLIC` is open. A video stays private
+  until the creator publishes it, even after encoding finishes.
+- Deleted or blocked accounts and deleted videos return "not found" rather than their data.
+
+**Protecting the videos and files**
+- Storage containers are **not public** (verified: blob public access is disabled on the storage account).
+- Every file the app touches is reached through a **short-lived signed (SAS) link** issued by the API after the
+  visibility check: upload links (write on exactly one blob, 3 hours), HLS segments (short-lived redirects), thumbnails
+  and downloads (≈30 minutes).
+- Private/unlisted playback uses an **HMAC-SHA256 playback ticket**: bound to one video, expires after 6 hours,
+  compared in constant time (`timingSafeEqual`); it cannot be reused for another video.
+- Image uploads (thumbnails, avatars, banners) are verified by their **file signature** (JPEG/PNG/GIF/WebP), so a
+  disguised file is refused. Uploaded videos are probed by FFmpeg in the worker; a file that is not a real video fails
+  processing and its storage is cleaned up.
+- Deleting a video really removes the database rows and every stored file (no lingering copies).
+
+**Input handling**
+- All request bodies and query strings are validated with **zod** (types, lengths, formats, allowed values); usernames
+  must match `^[a-z0-9_]{3,30}$`.
+- Database access goes through **Prisma** (parameterised queries). The few raw SQL statements use Prisma's tagged
+  template (`Prisma.sql`) with bound parameters, never string concatenation, so SQL injection is not possible through
+  them.
+- The app renders user text as React Native text (no HTML/JS execution), so there is no web-style XSS surface.
+- Error responses never include stack traces or raw database/Azure errors for server failures; the app shows friendly
+  messages and the client no longer prints diagnostics to the device log.
+
+**Transport**
+- The API is HTTPS only (verified: Container Apps ingress has insecure HTTP disabled); the storage account requires
+  HTTPS and TLS 1.2+; PostgreSQL connections require TLS (`sslmode=require`); the app only talks to the HTTPS API URL.
+- `helmet` sets the standard security headers on every response; the API trusts exactly one proxy hop so client IPs
+  (used for rate limiting) cannot be spoofed with extra `X-Forwarded-For` values.
+
+**Abuse resistance**
+- **Per-IP rate limits:** 3000 requests / 15 min general (a phone app makes many small calls and households share an
+  IP), 50 / 15 min on the webhook, and a separate, higher limiter for video-segment traffic so playback never starves
+  normal API calls. Blocks are logged with the caller and route.
+- Database **unique constraints** make likes, saves and follows idempotent, so scripts cannot inflate counters by
+  repeating a call; a view counts once per account per video (first watch only).
+- Registration of usernames is checked server-side regardless of the live availability hint (§8.6).
+
+**Secrets and infrastructure**
+- No secrets in the repository: `.env` files are git-ignored, no key files are tracked, and a scan of the full git
+  history found **no real credentials** (only placeholder examples in documentation).
+- Runtime secrets (database URL, Clerk keys, storage key) live as **Azure Container Apps secrets**; the encoding worker
+  gets its settings from there at deploy time. Secret values are masked in CI logs.
+- **Least-privilege cloud identities:** the CI/CD identity can only update the API app, push to the one registry and
+  manage container groups in one resource group; the autoscaler identity can only manage the worker group; neither can
+  read the database or storage. CI signs in with **OpenID Connect** (no stored cloud password), restricted to this
+  repository's `main` branch.
+- PostgreSQL has a **firewall allow-list** (the API's Azure services plus one developer address); temporary access
+  opened for maintenance is closed again immediately.
+- Deploys are reproducible and gated: one immutable image per commit, type-checks and tests must pass, a failed API
+  rollout leaves the previous version serving.
+
+**Privacy**
+- The app stores only what it needs (profile, content, social and viewing data). Account deletion removes the person's
+  data and creator videos, including files; a deleted account's username is released.
+- Push tokens are stored per device and removed with the account.
+
+### 11.3 What an attacker would have to get past (examples)
+
+| Goal | Obstacle |
+|---|---|
+| Watch someone's private video | server visibility check → short-lived signed links / per-video ticket; containers are not public |
+| Act as another user | needs a valid Clerk JWT; every action re-checks ownership |
+| Forge a user-creation/deletion event | webhook signature (Svix) must verify |
+| Read or change data via the API inputs | zod validation + parameterised queries |
+| Replace someone's video or thumbnail | upload links are scoped to one blob and expire; image signatures are checked |
+| Inflate views, likes, follows | unique constraints, first-watch-only views, rate limits |
+| Steal deploy access from GitHub | no stored cloud password; OIDC token only works for this repo's `main`; narrow role scope |
+| Reach the database from the internet | TLS required and a firewall allow-list |
+
+### 11.4 Shared responsibility
+
+Clerk (identity), Microsoft Azure (hosting, storage and database platform security, DDoS basics, patching of the
+managed services) and Expo (build/update delivery) are trusted providers. Account takeover protections such as **MFA**
+are configured in the Clerk dashboard, not in this code base.
+
+### 11.5 What has been checked
+
+- Verified against the live deployment: blob public access off, storage HTTPS-only with TLS 1.2+, ingress rejects
+  plain HTTP, PostgreSQL requires TLS, secrets are not tracked by git and absent from its history, cloud role
+  assignments are scoped as described.
+- Verified in code: authentication and ownership checks, visibility rules, webhook signature verification, ticket
+  signing with constant-time comparison, input schemas, parameterised SQL, error sanitising, rate limiter settings.
+- **Not** performed: penetration testing, fuzzing, a third-party dependency audit, load/abuse testing, mobile
+  binary hardening review.
+
+### 11.6 Known gaps and the plan to close them
+
+| # | Gap | Risk | Fix |
+|---|---|---|---|
+| 1 | **No size or content-type limit on the video upload link.** A signed-in creator could upload a huge or non-video file and consume storage. | Medium (cost / storage abuse) | Check the blob size at `complete`, reject and delete oversize files; per-creator upload quota; stricter content checks before encoding |
+| 2 | **The per-user token-bucket limiter needs Redis and is inactive** while Redis is not deployed (it was removed to save cost). Only per-IP limits apply. | Low–Medium | Re-enable Redis, or add an in-memory per-user limiter for a single replica |
+| 3 | **No DRM / encryption of the streams.** Segments are protected by short-lived links and tickets only. | Low for this use case | AES-128 HLS or DRM if protecting paid/exclusive content becomes a goal |
+| 4 | **CORS allows all origins.** The mobile app does not use browser cookies, so the practical risk is low, but it should be an allow-list before any web client exists. | Low | Restrict `cors()` to known origins |
+| 5 | **Containers run as root** (the image has no `USER`). | Low–Medium | Add a non-root user to the Dockerfile |
+| 6 | **Playback tickets appear in request logs** (`?pt=` is in the URL, and the logger prints the URL). Tickets are per-video and expire, but logs should not carry them. | Low | Redact query strings in the request logger |
+| 7 | **Tickets are signed with the Clerk secret key**, so rotating that key also invalidates open tickets. | Low | Use a dedicated `PLAYBACK_TICKET_SECRET` |
+| 8 | **Database TLS does not verify the server certificate** (`sslmode=require`), and the database has a public endpoint (protected by the firewall). | Low | `sslmode=verify-full` with the Azure CA, or private networking |
+| 9 | **No automated dependency or secret scanning** (Dependabot, secret scanning, `bun audit`) in CI. | Medium over time | Add Dependabot, GitHub secret scanning/push protection, an audit step |
+| 10 | **No admin console, content reports or audit trail.** Only creator-side comment removal exists. | Medium as the community grows | Report flow, moderation tools, audit log |
+| 11 | **No account-level brute-force/lockout rules of our own** (relies on Clerk's protections). | Low | Confirm Clerk bot/lockout and MFA settings |
+| 12 | **No WAF or advanced DDoS protection** beyond Azure's platform defaults. | Low at this scale | Azure Front Door / WAF if traffic grows |
+| 13 | **UNLISTED means anyone with the link can watch.** This is intended, but it is not access control. | Informational | Use PRIVATE for restricted content |
+| 14 | **No privacy policy / terms of service** in the app. | Compliance | Add before a public launch |
+
+### 11.7 Reporting a vulnerability
+
+Please do not open a public issue for a security problem. Contact the repository owner privately (GitHub profile) with
+steps to reproduce; please allow reasonable time for a fix before disclosing.
+
+---
+
+## 12. Complexity analysis (time and space)
 
 Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **B** = block size (4 MB),
 **D** = video duration, **R** = number of rungs.
@@ -546,7 +692,7 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
 
 ---
 
-## 12. Limitations
+## 13. Limitations
 
 - **Blu-ray PGS / DVD bitmap subtitles are not supported** (they are images). Text subtitles work.
 - **Extra audio tracks are stereo AAC 128 kbps**; a 5.1 extra track is down-mixed. Max 4 audio tracks per video.
@@ -557,7 +703,8 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
 - **Dual-audio playback on devices is not exhaustively tested:** the encode, alignment and playlist were verified with
   real files, but ExoPlayer's audio-track switching has not been checked on many phone models.
 - **No automatic reconciliation of orphan blobs** (a storage file whose database row is gone for an unusual reason).
-- **Rate limiting is per process**; with several API replicas the limits multiply unless Redis is enabled.
+- **Rate limiting is per IP and per process**; the per-user token bucket is inactive without Redis, and with several API
+  replicas the per-IP limits multiply.
 - **A stale hint is possible** in the username live-check for up to 5 minutes across replicas (saving is always exact).
 - **No DRM**: HLS segments are protected by short-lived signed links and tickets, not encryption. A user who can play a
   video can capture it.
@@ -567,7 +714,7 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
 
 ---
 
-## 13. Challenges we hit and how we solved them
+## 14. Challenges we hit and how we solved them
 
 | Challenge | What we did |
 |---|---|
@@ -589,7 +736,7 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
 
 ---
 
-## 14. Future plans
+## 15. Future plans
 
 **Product**
 - Playlists, channel pages with sections, community posts, premieres / scheduled publishing UI.
@@ -616,7 +763,7 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
 
 ---
 
-## 15. Running it locally
+## 16. Running it locally
 
 **Prerequisites:** Bun, Node, a PostgreSQL database, an Azure Storage account (or Azurite), a Clerk application, and for
 the app an Android emulator/device or Expo Go-compatible dev build.
@@ -651,7 +798,7 @@ docker run --env-file backend/.env tamasha bun run worker                # worke
 
 ---
 
-## 16. Testing
+## 17. Testing
 
 - **Unit tests** (`cd backend && bun test src/lib`): ladder selection, audio-track picking and playlist rewriting,
   job cancellation, purge targets, Bloom filter correctness and false-positive rate.
@@ -663,7 +810,7 @@ docker run --env-file backend/.env tamasha bun run worker                # worke
 
 ---
 
-## 17. Related documents
+## 18. Related documents
 
 - [API_DOCUMENTATION.md](API_DOCUMENTATION.md) — the REST contract.
 - [backend/docs/SCALABILITY_AUDIT.md](backend/docs/SCALABILITY_AUDIT.md) and
