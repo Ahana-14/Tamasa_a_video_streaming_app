@@ -1,4 +1,5 @@
 import { prisma } from "../config/db";
+import { UsernameFilter } from "./username-filter.service";
 import { purgeDeletedVideos } from "./purge.service";
 import { clerkClient } from "../config/clerk";
 import { ApiError } from "../middleware/errorHandler";
@@ -55,6 +56,7 @@ export const UserService = {
                 
                 },
             });
+            UsernameFilter.add(username);
             return user;
         } catch (error) {
             throw new Error(

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { prisma } from "../config/db";
+import { UsernameFilter } from "./username-filter.service";
 import { AzureStorageService } from "./azure-storage.service";
 import { assertImageBlob } from "../lib/assertImageBlob";
 import { ApiError } from "../middleware/errorHandler";
@@ -66,10 +67,12 @@ export const ProfileService = {
                 if (taken) throw new ApiError(409, "That username is already taken");
             }
             try {
-                return await prisma.profile.update({
+                const saved = await prisma.profile.update({
                     where: { userId: user.id },
                     data: updates,
                 });
+                if (updates.username) UsernameFilter.add(updates.username);
+                return saved;
             } catch (error: any) {
                 if (error?.code === 'P2002') throw new ApiError(409, "That username is already taken");
                 throw error;

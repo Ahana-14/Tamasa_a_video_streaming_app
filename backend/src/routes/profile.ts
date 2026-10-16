@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { UsernameFilter } from '../services/username-filter.service';
 import { sendSuccessResponse } from '../lib/apiResponse';
 import { asyncHandler } from '../lib/asyncHandler';
 import { ProfileService } from '../services/profile.service';
@@ -68,6 +69,11 @@ profileRouter.get(
         if (!username.success) {
             return sendSuccessResponse(res, { available: false, reason: 'invalid' });
         }
+        // Most names people try are free: the in-memory filter answers those without touching the database.
+        if (!UsernameFilter.mightBeTaken(username.data)) {
+            return sendSuccessResponse(res, { available: true, reason: null });
+        }
+        // "Maybe taken" (or filter not built yet): the database decides.
         const taken = await prisma.profile.findFirst({
             where: {
                 username: { equals: username.data, mode: 'insensitive' },
