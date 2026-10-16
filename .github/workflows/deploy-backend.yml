@@ -1,0 +1,101 @@
+name: Deploy backend
+
+# On every push to main that touches the backend: test, build one image, roll the API out, then replace the encoding
+# worker with the same image. Secrets are never stored in GitHub: Azure access uses OpenID Connect (no password), and the
+# runtime settings are read from the running Container App at deploy time.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/deploy-backend.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false # never interrupt a deploy half way
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  RESOURCE_GROUP: media-app-rg
+  REGISTRY: tamashatoufik01
+  API_APP: tamasha-api
+  WORKER_GROUP: tamasha-worker
+  LOCATION: centralindia
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push the image
+        id: image
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_SHA::10}" # a new tag per commit: Azure caches a failed tag name as "not found"
+          IMAGE="${REGISTRY}.azurecr.io/tamasha:${TAG}"
+          az acr login -n "$REGISTRY"
+          docker build -t "$IMAGE" backend
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # A failed rollout leaves the previous revision serving traffic, so a bad build never takes the API down.
+      - name: Roll out the API
+        run: |
+          set -euo pipefail
+          az config set extension.use_dynamic_install=yes_without_prompt extension.dynamic_install_allow_preview=true >/dev/null
+          az containerapp update -n "$API_APP" -g "$RESOURCE_GROUP" --image "${{ steps.image.outputs.image }}" -o none
+          FQDN=$(az containerapp show -n "$API_APP" -g "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn -o tsv)
+          for i in $(seq 1 12); do
+            code=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "https://$FQDN/health" || true)
+            [ "$code" = "200" ] && { echo "API healthy"; exit 0; }
+            sleep 10
+          done
+          echo "API did not become healthy" >&2; exit 1
+
+      # The worker runs the same code, so it is replaced too. It is stopped first (running jobs are handed back to the
+      # queue), recreated with the settings the API already holds, then stopped again: the API's autoscaler starts it
+      # whenever there is work.
+      - name: Replace the encoding worker
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.image.outputs.image }}"
+          secret() { az containerapp secret list -n "$API_APP" -g "$RESOURCE_GROUP" --show-values --query "[?name=='$1'].value | [0]" -o tsv; }
+          REG_USER=$(az containerapp show -n "$API_APP" -g "$RESOURCE_GROUP" --query "properties.configuration.registries[0].username" -o tsv)
+          REG_PASS=$(secret "${REGISTRY}azurecrio-${REGISTRY}")
+          for v in "$REG_PASS" ; do echo "::add-mask::$v"; done
+          DB=$(secret database-url); CPK=$(secret clerk-publishable-key); CSK=$(secret clerk-secret-key)
+          CWS=$(secret clerk-webhook-secret); AZS=$(secret azure-storage-connection-string)
+          for v in "$DB" "$CPK" "$CSK" "$CWS" "$AZS"; do echo "::add-mask::$v"; done
+
+          az container stop -n "$WORKER_GROUP" -g "$RESOURCE_GROUP" -o none 2>/dev/null || true
+          az container delete -n "$WORKER_GROUP" -g "$RESOURCE_GROUP" -y -o none 2>/dev/null || true
+          az container create -n "$WORKER_GROUP" -g "$RESOURCE_GROUP" --location "$LOCATION" \
+            --image "$IMAGE" --registry-login-server "$REGISTRY.azurecr.io" \
+            --registry-username "$REG_USER" --registry-password "$REG_PASS" \
+            --os-type Linux --cpu 4 --memory 8 --restart-policy Always --command-line "bun run worker" \
+            --environment-variables NODE_ENV=production WORKER_CONCURRENCY=3 \
+            --secure-environment-variables DATABASE_URL="$DB" CLERK_PUBLISHABLE_KEY="$CPK" CLERK_SECRET_KEY="$CSK" \
+              CLERK_WEBHOOK_SECRET="$CWS" AZURE_STORAGE_CONNECTION_STRING="$AZS" -o none
+
+          for i in $(seq 1 12); do
+            if az container logs -n "$WORKER_GROUP" -g "$RESOURCE_GROUP" 2>/dev/null | grep -q "worker started"; then
+              echo "Worker started"; az container stop -n "$WORKER_GROUP" -g "$RESOURCE_GROUP" -o none; exit 0
+            fi
+            sleep 10
+          done
+          echo "Worker did not report that it started" >&2; exit 1

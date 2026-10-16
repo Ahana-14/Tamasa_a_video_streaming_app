@@ -1,0 +1,47 @@
+name: Publish app update
+
+# Ships JavaScript-only changes to installed apps over the air (EAS Update, channel "preview"). Changes that need a new
+# native build (new native modules, app.json native settings) still require building a new APK with EAS Build.
+# Needs one repository secret, EXPO_TOKEN (an access token from expo.dev); without it the job skips itself.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-app.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-app
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend/vidoe_on_demand
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for the Expo token
+        id: token
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then echo "::notice::EXPO_TOKEN is not set, so no over-the-air update was published."; echo "present=false" >> "$GITHUB_OUTPUT"; else echo "present=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: oven-sh/setup-bun@v2
+        if: steps.token.outputs.present == 'true'
+      - run: bun install --frozen-lockfile
+        if: steps.token.outputs.present == 'true'
+      - name: Publish the update
+        if: steps.token.outputs.present == 'true'
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: bunx eas-cli update --branch preview --environment preview --message "${GITHUB_SHA::7} $(printf '%s' "$COMMIT_MESSAGE" | head -n 1)" --non-interactive

@@ -1,0 +1,47 @@
+name: CI
+
+# Type-checks and tests both halves of the project. Runs on every pull request, on pushes to main, and is reused by the
+# deploy workflows so nothing is deployed unless it passes.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (type-check + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # Prisma only needs *a* URL to read its config while generating the client, not a real database.
+      - name: Generate Prisma client
+        run: bunx prisma generate --config prisma7.config.ts
+        env:
+          DATABASE_URL: postgresql://build:build@localhost:5432/build
+      - run: bun tsc --noEmit
+      - run: bun test src/lib
+
+  frontend:
+    name: App (type-check)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend/vidoe_on_demand
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx tsc --noEmit
