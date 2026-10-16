@@ -182,7 +182,7 @@ VIDEO_ON_DEMAND _APP/
 | Worker hosting | **Azure Container Instances** (4 vCPU / 8 GB), started and stopped on demand |
 | Container registry | **Azure Container Registry** (Basic) |
 | Packaging | One **Docker** image (`oven/bun`) for both API and worker |
-| CI-less deploy | Local `docker build` → push → update Container App / recreate worker group |
+| CI/CD | GitHub Actions (checks + backend deploy + OTA publish), Azure sign-in via OIDC |
 | Source control | Git / GitHub |
 | Testing | `bun test` (unit tests for pure logic), real-database / real-storage end-to-end scripts during development |
 
@@ -485,9 +485,29 @@ updated atomically; the job queue is a plain table with an index on `(status, qu
 | Mobile | EAS Build (APK) + **EAS Update** OTA on channel `preview` | JS changes ship without a new APK |
 | Auth | Clerk | JWT + webhooks |
 
-**Release flow:** `docker build` → `docker push` to ACR → `az containerapp update --image …` (API) / recreate the worker
-group with the new image → `eas update` for app changes. (Azure caches a failed tag as "not found", so a retry after a
-failed build uses a new tag.)
+### CI/CD (GitHub Actions, `.github/workflows/`)
+
+| Workflow | Runs on | What it does |
+|---|---|---|
+| `ci.yml` | every pull request and push to `main` (and reused by the deploys) | backend: install, generate the Prisma client, `tsc --noEmit`, `bun test src/lib`; app: install, `tsc --noEmit` |
+| `deploy-backend.yml` | push to `main` touching `backend/**`, or manual run | runs CI → builds one image tagged with the commit SHA → pushes it to ACR → updates the API Container App and waits for `/health` → stops, recreates and re-verifies the encoding worker with the same image |
+| `deploy-app.yml` | push to `main` touching `frontend/**`, or manual run | runs CI → publishes an EAS Update (OTA) to the `preview` channel |
+
+How it is secured:
+- **No passwords in GitHub.** Azure access uses **OpenID Connect**: the workflow gets a short-lived token, and the Azure
+  identity `tamasha-github-deploy` trusts only this repository's `main` branch.
+- That identity can only: update the API Container App, push to the one registry, and manage container groups in the
+  one resource group. It cannot touch the database, storage or other resources.
+- The worker's runtime settings are **read from the running API app at deploy time** and masked in logs, so they are
+  never stored in GitHub.
+- The only GitHub entries are three non-secret variables (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+  `AZURE_SUBSCRIPTION_ID`) and the optional secret `EXPO_TOKEN` for app updates (without it the app-update job skips
+  itself).
+- Safety: deploys never overlap; a failing check blocks the deploy; if the new API revision does not start, Azure keeps
+  serving the previous one and the job fails; one commit = one immutable image tag (Azure caches a failed tag name as
+  "not found").
+- Not automated yet: database migrations (`prisma migrate deploy` is still run by hand) and native app builds (a new
+  APK needs EAS Build).
 
 **Cost behaviour:** the worker bills per second only while encoding. Redis was deliberately removed from the deployment
 to save money since the app does not need it at this scale. Always-on costs are the API, the registry, PostgreSQL and
@@ -542,7 +562,7 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
 - **No DRM**: HLS segments are protected by short-lived signed links and tickets, not encryption. A user who can play a
   video can capture it.
 - **Android is the primary tested target**; iOS builds exist in config but are not part of regular testing.
-- **No CI/CD pipeline:** builds and deploys are scripted by hand.
+- **CI/CD covers checks, the backend deploy and OTA updates only:** database migrations and native (APK) builds are still manual; there are no end-to-end tests in CI.
 - Content moderation tooling is limited to creator-side comment removal; there is no admin console or report flow yet.
 
 ---
@@ -591,7 +611,7 @@ Let **n** = rows in the relevant table, **k** = page size, **F** = file size, **
   replicas.
 - CDN in front of Blob Storage for segments; multi-region storage.
 - Queue the push delivery; move the job queue to a dedicated broker if throughput requires.
-- CI/CD (GitHub Actions: type-check, tests, build, deploy), observability (structured logs, metrics, tracing, alerts),
+- Run database migrations from the pipeline, add integration tests to CI, preview environments per pull request, observability (structured logs, metrics, tracing, alerts),
   load tests with recorded baselines, and Azure budget alerts.
 
 ---
