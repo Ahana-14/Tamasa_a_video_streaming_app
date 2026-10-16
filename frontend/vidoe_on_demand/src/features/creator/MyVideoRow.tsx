@@ -103,7 +103,7 @@ export const MyVideoRow = ({
         </View>
 
         <View style={styles.meta}>
-          <AppText variant='label' numberOfLines={2}>
+          <AppText variant='label' numberOfLines={1}>
             {video.title}
           </AppText>
           <View style={styles.statusRow}>

@@ -82,7 +82,7 @@ export const DownloadRow = memo(
             </Thumbnail>
           </View>
           <View style={styles.text}>
-            <AppText variant='title' numberOfLines={2}>
+            <AppText variant='title' numberOfLines={1}>
               {record.title}
             </AppText>
             <AppText

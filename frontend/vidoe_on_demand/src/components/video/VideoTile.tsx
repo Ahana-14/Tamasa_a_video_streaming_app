@@ -27,7 +27,7 @@ export const VideoTile = memo(({ video, progressPercent }: Props) => {
         {progressPercent ? <ProgressBar percent={progressPercent} overlay /> : null}
       </Thumbnail>
       <View style={styles.text}>
-        <AppText variant="title" numberOfLines={2}>
+        <AppText variant="title" numberOfLines={1}>
           {video.title}
         </AppText>
         <AppText variant="bodySmall" color="secondary" numberOfLines={1}>

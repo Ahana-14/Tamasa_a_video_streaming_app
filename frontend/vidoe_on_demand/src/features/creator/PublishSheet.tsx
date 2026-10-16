@@ -85,7 +85,7 @@ export const PublishSheet = ({ video, onClose }: Props) => {
           <AppText variant='title'>
             {published ? 'Change visibility' : 'Publish video'}
           </AppText>
-          <AppText variant='bodySmall' color='secondary' numberOfLines={2}>
+          <AppText variant='bodySmall' color='secondary' numberOfLines={1}>
             {video.title}
           </AppText>
 

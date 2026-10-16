@@ -43,7 +43,7 @@ export const VideoCard = memo(({ video, hideCreator = false }: Props) => {
           <Avatar uri={video.creator.avatarUrl} name={video.creator.name} size='md' />
         </PressableScale>
         <PressableScale style={styles.text} accessibilityRole='button' accessibilityLabel={videoA11yLabel(video)} onPress={openVideo}>
-          <AppText variant='title' numberOfLines={2}>
+          <AppText variant='title' numberOfLines={1}>
             {video.title}
           </AppText>
           <AppText variant='bodySmall' color='secondary' numberOfLines={1}>

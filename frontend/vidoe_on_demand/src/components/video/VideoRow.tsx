@@ -59,7 +59,7 @@ export const VideoRow = memo(
             </Thumbnail>
           </View>
           <View style={styles.text}>
-            <AppText variant='title' numberOfLines={2}>
+            <AppText variant='title' numberOfLines={1}>
               {video.title}
             </AppText>
             <AppText variant='bodySmall' color='secondary' numberOfLines={1}>

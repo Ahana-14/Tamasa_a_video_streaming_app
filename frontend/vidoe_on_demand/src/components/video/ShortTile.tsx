@@ -30,7 +30,7 @@ export const ShortTile = memo(({ video, style }: { video: VideoCardData; style?:
           />
         ) : null}
       </View>
-      <AppText variant='bodySmall' numberOfLines={2} style={styles.title}>
+      <AppText variant='bodySmall' numberOfLines={1} style={styles.title}>
         {video.title}
       </AppText>
       <AppText variant='caption' color='muted'>

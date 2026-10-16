@@ -33,7 +33,7 @@ export const TopVideoRow = ({ video, rank, onPress }: Props) => (
       ) : null}
     </View>
     <View style={styles.meta}>
-      <AppText variant='label' numberOfLines={2}>
+      <AppText variant='label' numberOfLines={1}>
         {video.title}
       </AppText>
       <AppText variant='bodySmall' color='secondary'>
