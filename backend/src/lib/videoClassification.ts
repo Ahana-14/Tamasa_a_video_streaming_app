@@ -1,4 +1,5 @@
-export const SHORT_MAX_DURATION = 60_000;
+// A vertical (or square) video up to 3 minutes is a Short.
+export const SHORT_MAX_DURATION = 180_000;
 export const SHORT_DURATION_TOLERANCE = 500;
 
 // width / height. 9:16 = 0.5625, 4:5 = 0.8, 1:1 = 1.0. Phones shoot 720x1280 (0.5625) and 1080x2340 (0.46);
@@ -26,7 +27,7 @@ export const getDisplayDimensions = (
 };
 
 /**
- * SHORT_FORM only when BOTH hold: short enough (60s) AND square or portrait (1:1 or taller).
+ * SHORT_FORM only when BOTH hold: short enough (3 minutes) AND square or portrait (1:1 or taller).
  * Unknown/zero values fall back to LONG_FORM — the safe default, since a
  * misfiled Short in the home feed is far less harmful than a long video
  * vanishing into the shorts section.
