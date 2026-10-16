@@ -29,6 +29,7 @@ worker, PostgreSQL, Azure Blob Storage and Azure container hosting.
 16. [Running it locally](#16-running-it-locally)
 17. [Testing](#17-testing)
 18. [Related documents](#18-related-documents)
+
 ---
 
 ## 1. Project goal
